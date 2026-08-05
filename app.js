@@ -1,104 +1,69 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserLocalPersistence, GoogleAuthProvider, signInWithPopup, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
-import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, doc, setDoc, getDoc, updateDoc, collection, query, where, getDocs, getDocsFromServer, deleteDoc, runTransaction, increment, addDoc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+// ==================== ПУТЬ К УСПЕХУ — ЛОКАЛЬНАЯ ВЕРСИЯ ====================
 
-const firebaseConfig = {
-    apiKey: "AIzaSyAAL1zpUJuZET0ZDoQQGeiIIFruUocf8pY",
-    authDomain: "business-21bba.firebaseapp.com",
-    projectId: "business-21bba",
-    storageBucket: "business-21bba.firebasestorage.app",
-    messagingSenderId: "54951370679",
-    appId: "1:54951370679:web:cc72b88921c90d2f7ad232",
-    measurementId: "G-CXKVPKQHHG"
-};
+// ===== ХРАНИЛИЩЕ =====
+const ACCOUNTS_KEY = 'game_accounts';
+const SESSION_KEY = 'game_session';
+const MARKET_KEY = 'game_market_prices';
+const AUCTIONS_KEY = 'game_auctions';
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = initializeFirestore(app, {
-    localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
-});
-
-// ==================== ЗАЩИТА ОТ СБОЕВ ====================
-// Ловим необработанные ошибки, чтобы игра не ломалась
-window.addEventListener('unhandledrejection', (e) => {
-    console.warn('Поймана ошибка (не критично):', e.reason);
-    e.preventDefault();
-});
-
-window.addEventListener('offline', () => {
-    window.notify("📡 Нет соединения — игра работает оффлайн", "error");
-});
-
-window.addEventListener('online', () => {
-    window.notify("📡 Соединение восстановлено", "success");
-});
-
-// Запись с повторными попытками (если сеть мигнула)
-async function safeWrite(ref, data, retries = 3) {
-    for (let i = 0; i < retries; i++) {
-        try {
-            await updateDoc(ref, data);
-            return true;
-        } catch (e) {
-            console.warn(`Запись ${i + 1} не удалась:`, e.code || e.message);
-            if (i < retries - 1) await new Promise(r => setTimeout(r, 600 * (i + 1)));
-        }
-    }
-    return false;
-}
-
-// ==================== ОЧЕРЕДЬ ЗАПИСЕЙ (кликер) ====================
-// Клики копятся локально и отправляются в базу раз в 2.5 сек,
-// а не каждый клик — это убирает 90% сбоев и ошибок базы
-window.pendingChanges = { stamina: 0, usdt: 0 };
-let saveTimer = null;
-
-function queueChange(reward) {
-    window.pendingChanges.stamina -= 1;
-    window.pendingChanges.usdt += reward;
-    if (!saveTimer) saveTimer = setTimeout(flushChanges, 2500);
-}
-
-async function flushChanges() {
-    saveTimer = null;
-    const ch = window.pendingChanges;
-    if (ch.stamina === 0 && ch.usdt === 0) return;
-    window.pendingChanges = { stamina: 0, usdt: 0 };
-    const ok = await safeWrite(doc(db, "users", window.currentUser.uid), {
-        stamina: increment(ch.stamina),
-        usdt: increment(ch.usdt)
-    });
-    if (!ok) { // не удалось — вернём в очередь и попробуем позже
-        window.pendingChanges.stamina += ch.stamina;
-        window.pendingChanges.usdt += ch.usdt;
-        saveTimer = setTimeout(flushChanges, 5000);
-    }
-}
-
-// Сохраняем сразу, если игрок сворачивает вкладку
-document.addEventListener('visibilitychange', () => { if (document.hidden) flushChanges(); });
-
-window.currentUser = null;
+window.currentUserKey = null;
 window.userData = null;
 window.settings = {
-    vibration: true,
-    tooltips: true,
-    music: true,
-    bgColor1: '#1a0a2e',
-    bgColor2: '#0d1b3e',
-    bgColor3: '#2e0a1f',
-    bgBlobCount: 2,
-    notifPosition: 'top-right'
+    vibration: true, tooltips: true, music: true,
+    bgColor1: '#1a0a2e', bgColor2: '#0d1b3e', bgColor3: '#2e0a1f',
+    bgBlobCount: 2, notifPosition: 'top-right'
 };
 
 window.CONFIG = {
     START_USDT: 100, START_STAMINA: 100, BASE_MAX_STAMINA: 100,
-    START_POWER: 100, START_MULTIPLIER: 1.0, CLICK_REWARD: 0.00001, MINER_WORK_HOURS: 2
+    START_POWER: 100, START_MULTIPLIER: 1.0, CLICK_REWARD: 0.00001,
+    MINER_WORK_HOURS: 2, MINER_REWARD_PER_MIN: 0.00001, STAMINA_RECOVERY_SEC: 30
 };
 
 window.ANTI_CHEAT = { history: [], blocked: false };
 
-// ==================== НАСТРОЙКИ ФОНА ====================
+// ===== АККАУНТЫ (localStorage) =====
+function getAccounts() {
+    try { return JSON.parse(localStorage.getItem(ACCOUNTS_KEY)) || {}; }
+    catch (e) { return {}; }
+}
+function saveAccounts(accounts) {
+    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(accounts));
+}
+function hashPassword(pass) {
+    let hash = 0;
+    const str = pass + '_put_k_uspehu_salt';
+    for (let i = 0; i < str.length; i++) {
+        hash = ((hash << 5) - hash) + str.charCodeAt(i);
+        hash |= 0;
+    }
+    return String(hash);
+}
+function defaultPlayerData(nick) {
+    return {
+        nick,
+        usdt: CONFIG.START_USDT, stamina: CONFIG.START_STAMINA,
+        maxStamina: CONFIG.BASE_MAX_STAMINA, power: CONFIG.START_POWER,
+        multiplier: CONFIG.START_MULTIPLIER, level: 0,
+        balances: { BTC: 0, ETH: 0, LTC: 0, BNB: 0, TRX: 0, XRP: 0, GOLD: 0, SILVER: 0, PLAT: 0, DIAMOND: 0, SAPPHIRE: 0, RUBY: 0 },
+        businesses: [], activeInvestments: [],
+        bank: { deposit: 0, depositDate: null, loan: 0, loanDate: null },
+        miner: { running: false, startTime: null, currency: 'BTC' },
+        transactions: [],
+        lastActiveMs: Date.now(),
+        createdAt: new Date().toISOString()
+    };
+}
+function savePlayerData() {
+    if (!window.currentUserKey || !window.userData) return;
+    const accounts = getAccounts();
+    if (accounts[window.currentUserKey]) {
+        accounts[window.currentUserKey].data = window.userData;
+        saveAccounts(accounts);
+    }
+}
+
+// ===== НАСТРОЙКИ =====
 function applyBackgroundColors() {
     document.documentElement.style.setProperty('--bg-color-1', window.settings.bgColor1);
     document.documentElement.style.setProperty('--bg-color-2', window.settings.bgColor2);
@@ -108,45 +73,14 @@ function applyBackgroundColors() {
     if (blob2) blob2.style.display = window.settings.bgBlobCount >= 2 ? 'block' : 'none';
     if (blob3) blob3.style.display = window.settings.bgBlobCount >= 3 ? 'block' : 'none';
 }
-
-function saveSettingsToStorage() {
-    localStorage.setItem('gameSettings', JSON.stringify(window.settings));
-}
-
+function saveSettingsToStorage() { localStorage.setItem('gameSettings', JSON.stringify(window.settings)); }
 function loadSettings() {
     const saved = localStorage.getItem('gameSettings');
-    if (saved) {
-        window.settings = { ...window.settings, ...JSON.parse(saved) };
-        applyBackgroundColors();
-    }
+    if (saved) { window.settings = { ...window.settings, ...JSON.parse(saved) }; applyBackgroundColors(); }
 }
-
 loadSettings();
 
-// ==================== УСТРОЙСТВО ====================
-async function getDeviceInfo() {
-    let ip = "unknown";
-    try {
-        const res = await fetch("https://api.ipify.org?format=json");
-        ip = (await res.json()).ip;
-    } catch (e) {
-        try {
-            const res = await fetch("https://ipapi.co/json/");
-            ip = (await res.json()).ip;
-        } catch (e2) { console.warn("IP недоступен"); }
-    }
-    return { ip, userAgent: navigator.userAgent, platform: navigator.platform, language: navigator.language };
-}
-
-async function checkDeviceMatch(savedDevice) {
-    if (!savedDevice) return { match: false, reason: "Нет данных устройства" };
-    const current = await getDeviceInfo();
-    if (savedDevice.ip !== current.ip) return { match: false, reason: "IP-адрес изменился" };
-    if (savedDevice.userAgent !== current.userAgent) return { match: false, reason: "Устройство или браузер изменились" };
-    return { match: true };
-}
-
-// ==================== НАВИГАЦИЯ ====================
+// ===== НАВИГАЦИЯ =====
 window.navigateTo = (pageName) => {
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
     document.getElementById(`page-${pageName}`).classList.add('active');
@@ -160,7 +94,7 @@ window.navigateTo = (pageName) => {
         const titles = {
             clicker: 'Кликер', miner: 'Майнер', market: 'Рынок',
             invest: 'Инвестиции', business: 'Бизнесы', bank: 'Банк',
-            theft: 'Крипто-Рейд', auction: 'Аукционы', top: 'Топ', profile: 'Профиль'
+            auction: 'Аукционы', profile: 'Профиль'
         };
         pageTitle.innerHTML = `<span class="title-oval">${titles[pageName] || pageName}</span>`;
     }
@@ -168,154 +102,24 @@ window.navigateTo = (pageName) => {
     if (pageName === 'invest') renderInvestments();
     if (pageName === 'business') renderBusinesses();
     if (pageName === 'bank') renderBank();
-    if (pageName === 'top') loadTopData();
     if (pageName === 'profile') renderProfile();
     if (pageName === 'auction') renderAuctions();
+    if (pageName === 'clicker') updateClickerStats();
 };
-
 window.goHome = () => window.navigateTo('home');
 
-// ==================== АВТОРИЗАЦИЯ ====================
+// ===== АВТОРИЗАЦИЯ =====
 window.showRegister = () => {
     document.getElementById('login-form').style.display = 'none';
     document.getElementById('register-form').style.display = 'block';
     document.getElementById('auth-error').textContent = '';
 };
-
 window.showLogin = () => {
     document.getElementById('register-form').style.display = 'none';
     document.getElementById('login-form').style.display = 'block';
     document.getElementById('auth-error').textContent = '';
 };
-
-function showError(msg) {
-    let friendlyMsg = msg;
-    if (msg.includes('auth/invalid-email')) friendlyMsg = '❌ Неверный формат Email. Пример: user@example.com';
-    else if (msg.includes('auth/user-not-found')) friendlyMsg = '❌ Пользователь с таким Email не найден.';
-    else if (msg.includes('auth/wrong-password')) friendlyMsg = '❌ Неверный пароль.';
-    else if (msg.includes('auth/email-already-in-use')) friendlyMsg = '❌ Этот Email уже зарегистрирован.';
-    else if (msg.includes('auth/weak-password')) friendlyMsg = '❌ Пароль слишком слабый (мин. 6 символов).';
-    else if (msg.includes('auth/too-many-requests')) friendlyMsg = '⏳ Слишком много попыток. Подождите.';
-    document.getElementById('auth-error').textContent = friendlyMsg;
-}
-
-async function createNewProfile(user, nick, email, isAnonymous = false) {
-    await setDoc(doc(db, "users", user.uid), {
-        nick, email, isAnonymous,
-        lastActiveMs: Date.now(),
-        usdt: 100, stamina: 100, maxStamina: 100, power: 100, multiplier: 1.0, level: 0,
-        balances: { BTC: 0, ETH: 0, LTC: 0, BNB: 0, TRX: 0, XRP: 0, GOLD: 0, SILVER: 0, PLAT: 0, DIAMOND: 0, SAPPHIRE: 0, RUBY: 0 },
-        businesses: [], activeInvestments: [],
-        bank: { deposit: 0, depositDate: null, loan: 0, loanDate: null },
-        miner: { running: false, startTime: null, currency: 'BTC' },
-        transactions: [],
-        device: await getDeviceInfo(),
-        createdAt: new Date().toISOString()
-    });
-}
-
-window.register = async () => {
-    const nick = document.getElementById('reg-nick').value.trim();
-    const email = document.getElementById('reg-email').value.trim();
-    const pass = document.getElementById('reg-password').value;
-    const passConf = document.getElementById('reg-password-confirm').value;
-    document.getElementById('auth-error').textContent = '';
-    if (!nick || nick.length < 2 || nick.length > 20) return showError("Ник от 2 до 20 символов");
-    if (!email || !email.includes('@')) return showError("Введите корректный Email");
-    if (pass.length < 6) return showError("Пароль минимум 6 символов");
-    if (pass !== passConf) return showError("Пароли не совпадают");
-    try {
-        const userCred = await createUserWithEmailAndPassword(auth, email, pass);
-        await createNewProfile(userCred.user, nick, email);
-    } catch (e) { showError(e.message); }
-};
-
-window.login = async () => {
-    const email = document.getElementById('login-email').value.trim();
-    const pass = document.getElementById('login-password').value;
-    document.getElementById('auth-error').textContent = '';
-    if (!email || !pass) return showError("Заполните все поля");
-    try { await signInWithEmailAndPassword(auth, email, pass); }
-    catch (e) { showError(e.message); }
-};
-
-window.signInWithGoogle = async () => {
-    document.getElementById('auth-error').textContent = '';
-    try {
-        const provider = new GoogleAuthProvider();
-        const result = await signInWithPopup(auth, provider);
-        const user = result.user;
-        const docSnap = await getDoc(doc(db, "users", user.uid));
-        if (!docSnap.exists()) {
-            await createNewProfile(user, user.displayName || user.email.split('@')[0], user.email);
-        }
-    } catch (e) { showError(e.message); }
-};
-
-window.signInAnonymously = async () => {
-    document.getElementById('auth-error').textContent = '';
-    try {
-        const result = await signInAnonymously(auth);
-        const num = await takePlayerNumber();
-        await createNewProfile(result.user, "player_" + num, null, true);
-    } catch (e) { showError(e.message); }
-};
-
-// Выдаёт свободный номер: сначала освобождённый, иначе следующий
-async function takePlayerNumber() {
-    const metaRef = doc(db, "global", "meta");
-    let assigned = null;
-    await runTransaction(db, async (tx) => {
-        const snap = await tx.get(metaRef);
-        let meta = snap.exists() ? snap.data() : { nextPlayerNumber: 1, freeNumbers: [] };
-        if (!meta.freeNumbers) meta.freeNumbers = [];
-        if (!meta.nextPlayerNumber) meta.nextPlayerNumber = 1;
-        if (meta.freeNumbers.length > 0) {
-            assigned = meta.freeNumbers.shift();
-        } else {
-            assigned = meta.nextPlayerNumber;
-            meta.nextPlayerNumber += 1;
-        }
-        tx.set(metaRef, meta);
-    });
-    return assigned;
-}
-
-// Удаляет анонимов, мёртвых 30+ дней, и освобождает их номера
-async function cleanupOldAnonymous() {
-    try {
-        const last = localStorage.getItem('lastCleanup');
-        if (last && Date.now() - parseInt(last) < 24 * 60 * 60 * 1000) return;
-        localStorage.setItem('lastCleanup', String(Date.now()));
-        const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
-        const snap = await getDocs(query(collection(db, "users"), where("lastActiveMs", "<", cutoff)));
-        const freed = [];
-        for (const d of snap.docs) {
-            const data = d.data();
-            if (data.isAnonymous && data.nick && data.nick.startsWith("player_")) {
-                try {
-                    await deleteDoc(d.ref);
-                    const n = parseInt(data.nick.split("_")[1]);
-                    if (!isNaN(n)) freed.push(n);
-                } catch (e) {}
-            }
-        }
-        if (freed.length) {
-            await runTransaction(db, async (tx) => {
-                const s = await tx.get(doc(db, "global", "meta"));
-                let meta = s.exists() ? s.data() : { nextPlayerNumber: 1, freeNumbers: [] };
-                meta.freeNumbers = [...(meta.freeNumbers || []), ...freed].sort((a, b) => a - b);
-                tx.set(doc(db, "global", "meta"), meta);
-            });
-        }
-    } catch (e) { console.warn("Очистка:", e); }
-}
-
-window.logout = async () => {
-    await signOut(auth);
-    document.getElementById('login-email').value = '';
-    document.getElementById('login-password').value = '';
-};
+function showError(msg) { document.getElementById('auth-error').textContent = msg; }
 
 window.togglePassword = (inputId, btn) => {
     const input = document.getElementById(inputId);
@@ -323,52 +127,87 @@ window.togglePassword = (inputId, btn) => {
     else { input.type = 'password'; btn.textContent = '👁'; }
 };
 
-onAuthStateChanged(auth, async (user) => {
-    const authScreen = document.getElementById('auth-screen');
-    const gameScreen = document.getElementById('game-screen');
-    if (user) {
-        window.currentUser = user;
-        try {
-            const docSnap = await getDoc(doc(db, "users", user.uid));
-            if (docSnap.exists()) {
-                window.userData = docSnap.data();
-                authScreen.style.display = 'none';
-                gameScreen.style.display = 'flex';
-                updateUI();
-                checkOfflineMiner();
-                if (window.settings.music) applyMusic();
-                showDiscordNotification("С возвращением!", `${window.userData.nick}, рады видеть вас снова!`, "👋");
-                                updateDoc(doc(db, "users", user.uid), { lastActiveMs: Date.now() }).catch(() => {});
-                cleanupOldAnonymous();
-                // Проверка устройства в фоне — не задерживает вход
-                checkDeviceMatch(window.userData.device).then(async (check) => {
-                    if (!check.match) {
-                        await signOut(auth);
-                        showError(`⚠️ ${check.reason}. Войдите заново.`);
-                    } else {
-                        const currentDevice = await getDeviceInfo();
-                        if (JSON.stringify(window.userData.device) !== JSON.stringify(currentDevice)) {
-                            safeWrite(doc(db, "users", user.uid), { device: currentDevice });
-                        }
-                    }
-                });
-            } else {
-                await signOut(auth);
-                showError("Ошибка загрузки профиля.");
-            }
-        } catch (error) {
-            console.error('Ошибка:', error);
-            showError("Ошибка подключения к базе данных.");
-        }
-    } else {
-        window.currentUser = null;
-        window.userData = null;
-        gameScreen.style.display = 'none';
-        authScreen.style.display = 'flex';
-    }
-});
+window.register = () => {
+    const nick = document.getElementById('reg-nick').value.trim();
+    const pass = document.getElementById('reg-password').value;
+    const passConf = document.getElementById('reg-password-confirm').value;
+    showError('');
+    if (!nick || nick.length < 2 || nick.length > 20) return showError("Ник от 2 до 20 символов");
+    if (pass.length < 4) return showError("Пароль минимум 4 символа");
+    if (pass !== passConf) return showError("Пароли не совпадают");
+    const accounts = getAccounts();
+    const key = nick.toLowerCase();
+    if (accounts[key]) return showError("Этот ник уже занят");
+    accounts[key] = { password: hashPassword(pass), data: defaultPlayerData(nick) };
+    saveAccounts(accounts);
+    startSession(key);
+};
 
-// ==================== UI ====================
+window.login = () => {
+    const nick = document.getElementById('login-nick').value.trim();
+    const pass = document.getElementById('login-password').value;
+    showError('');
+    if (!nick || !pass) return showError("Заполните все поля");
+    const accounts = getAccounts();
+    const key = nick.toLowerCase();
+    const acc = accounts[key];
+    if (!acc) return showError("Игрок с таким ником не найден");
+    if (acc.password !== hashPassword(pass)) return showError("Неверный пароль");
+    startSession(key);
+};
+
+function startSession(key) {
+    localStorage.setItem(SESSION_KEY, key);
+    enterGame();
+}
+
+function enterGame() {
+    const key = localStorage.getItem(SESSION_KEY);
+    const accounts = getAccounts();
+    if (!key || !accounts[key]) return false;
+    window.currentUserKey = key;
+    window.userData = accounts[key].data;
+    recoverStamina();
+    document.getElementById('auth-screen').style.display = 'none';
+    document.getElementById('game-screen').style.display = 'flex';
+    updateUI();
+    checkOfflineMiner();
+    if (window.settings.music) applyMusic();
+    showDiscordNotification("С возвращением!", `${window.userData.nick}, рады видеть вас снова!`, "👋");
+    return true;
+}
+
+window.logout = () => {
+    savePlayerData();
+    localStorage.removeItem(SESSION_KEY);
+    window.currentUserKey = null;
+    window.userData = null;
+    document.getElementById('game-screen').style.display = 'none';
+    document.getElementById('auth-screen').style.display = 'flex';
+    document.getElementById('login-nick').value = '';
+    document.getElementById('login-password').value = '';
+    showLogin();
+};
+
+// Автосохранение
+setInterval(savePlayerData, 5000);
+document.addEventListener('visibilitychange', () => { if (document.hidden) savePlayerData(); });
+window.addEventListener('beforeunload', savePlayerData);
+
+// ===== СТАМИНА =====
+function recoverStamina() {
+    const p = window.userData;
+    if (!p) return;
+    const now = Date.now();
+    const last = p.lastActiveMs || now;
+    const deltaSec = (now - last) / 1000;
+    if (deltaSec > 0 && p.stamina < p.maxStamina) {
+        p.stamina = Math.min(p.maxStamina, p.stamina + deltaSec / CONFIG.STAMINA_RECOVERY_SEC);
+    }
+    p.lastActiveMs = now;
+}
+
+// ===== UI =====
 window.updateUI = () => {
     if (!window.userData) return;
     document.getElementById('usdt-display').textContent = window.userData.usdt.toFixed(2);
@@ -394,7 +233,7 @@ function showDiscordNotification(title, message, icon = '🔔') {
     setTimeout(() => notif.classList.remove('show'), 5000);
 }
 
-// ==================== АНТИ-ЧИТ ====================
+// ===== АНТИ-ЧИТ =====
 window.validateClick = (x, y) => {
     if (window.ANTI_CHEAT.blocked) return false;
     const now = performance.now();
@@ -406,7 +245,6 @@ window.validateClick = (x, y) => {
     }
     return true;
 };
-
 function blockInput(reason) {
     window.ANTI_CHEAT.blocked = true;
     window.notify(`⚠️ ${reason} Блок 10 сек.`, "error");
@@ -418,20 +256,31 @@ function blockInput(reason) {
     }, 10000);
 }
 
-// ==================== КЛИКЕР ====================
+// ===== КЛИКЕР =====
+function updateClickerStats() {
+    if (!window.userData) return;
+    document.getElementById('click-power').textContent = window.userData.power;
+    document.getElementById('click-mult').textContent = window.userData.multiplier.toFixed(1);
+    document.getElementById('clicker-stamina').textContent = `${Math.floor(window.userData.stamina)}/${window.userData.maxStamina}`;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     const clickBtn = document.getElementById('click-btn');
     if (clickBtn) {
         const handleClick = (e) => {
-            if (!window.userData || window.userData.stamina <= 0) { window.notify("Нет стамины!", "error"); return; }
+            if (!window.userData) return;
+            recoverStamina();
+            if (window.userData.stamina < 1) { window.notify("Нет стамины!", "error"); updateClickerStats(); return; }
             const rect = clickBtn.getBoundingClientRect();
             const x = e.clientX || (e.touches ? e.touches[0].clientX : rect.left + rect.width / 2);
             const y = e.clientY || (e.touches ? e.touches[0].clientY : rect.top + rect.height / 2);
             if (!window.validateClick(x, y)) return;
-            const reward = window.userData.power * window.userData.multiplier * window.CONFIG.CLICK_REWARD;
+            const reward = window.userData.power * window.userData.multiplier * CONFIG.CLICK_REWARD;
             window.userData.stamina -= 1;
             window.userData.usdt += reward;
-            window.updateUI();
+            window.userData.lastActiveMs = Date.now();
+            updateUI();
+            updateClickerStats();
             const effect = document.createElement('div');
             effect.className = 'click-effect';
             effect.textContent = `+${reward.toFixed(6)}`;
@@ -439,59 +288,111 @@ document.addEventListener('DOMContentLoaded', () => {
             effect.style.top = `${y}px`;
             document.body.appendChild(effect);
             setTimeout(() => effect.remove(), 1000);
-            queueChange(reward);
+            savePlayerData();
         };
         clickBtn.addEventListener('mousedown', handleClick);
         clickBtn.addEventListener('touchstart', (e) => { e.preventDefault(); handleClick(e); }, { passive: false });
     }
-});
 
-// ==================== МАЙНЕР ====================
-function checkOfflineMiner() {
-    if (!window.userData.miner || !window.userData.miner.running || !window.userData.miner.startTime) return;
-    const now = Date.now();
-    const start = new Date(window.userData.miner.startTime).getTime();
-    const elapsed = (now - start) / 1000;
-    const maxSec = window.CONFIG.MINER_WORK_HOURS * 3600;
-    if (elapsed >= maxSec) {
-        window.userData.miner.running = false;
-        window.userData.miner.startTime = null;
-        updateDoc(doc(db, "users", window.currentUser.uid), { miner: { running: false, startTime: null, currency: window.userData.miner.currency } });
-        showDiscordNotification("Майнер завершил!", "Забрать награду в разделе Майнер", "⛏");
-    } else {
-        const progress = (elapsed / maxSec) * 100;
-        const remaining = Math.ceil((maxSec - elapsed) / 60);
-        document.getElementById('miner-progress').style.width = `${progress}%`;
-        document.getElementById('miner-time-left').textContent = `${remaining} мин`;
-        document.getElementById('miner-status').textContent = "🟢 Работает";
-        document.getElementById('miner-toggle-btn').textContent = "⏹ Остановить";
-    }
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-    const btn = document.getElementById('miner-toggle-btn');
-    if (btn) btn.addEventListener('click', async () => {
-        if (!window.userData.miner) window.userData.miner = { running: false, startTime: null, currency: 'BTC' };
-        if (window.userData.miner.running) {
-            window.userData.miner.running = false;
-            window.userData.miner.startTime = null;
+    // МАЙНЕР кнопка
+    const minerBtn = document.getElementById('miner-toggle-btn');
+    if (minerBtn) minerBtn.addEventListener('click', () => {
+        if (!window.userData) return;
+        const m = window.userData.miner;
+        if (m.running) {
+            // Остановка с начислением за отработанное время
+            const start = new Date(m.startTime).getTime();
+            const minutes = Math.floor((Date.now() - start) / 60000);
+            const reward = minutes * CONFIG.MINER_REWARD_PER_MIN * window.userData.multiplier;
+            if (reward > 0) {
+                window.userData.balances[m.currency] = (window.userData.balances[m.currency] || 0) + reward;
+                addTransaction(`Майнер: +${reward.toFixed(6)} ${m.currency}`, 0);
+                window.notify(`⛏ +${reward.toFixed(6)} ${m.currency}`, "success");
+            }
+            m.running = false;
+            m.startTime = null;
             document.getElementById('miner-progress').style.width = '0%';
             document.getElementById('miner-time-left').textContent = '0 мин';
             document.getElementById('miner-status').textContent = '🔴 Остановлен';
-            document.getElementById('miner-toggle-btn').textContent = '▶️ Запустить';
+            minerBtn.textContent = '▶️ Запустить';
         } else {
-            window.userData.miner.running = true;
-            window.userData.miner.startTime = new Date().toISOString();
-            window.userData.miner.currency = document.getElementById('miner-currency').value;
+            m.running = true;
+            m.startTime = new Date().toISOString();
+            m.currency = document.getElementById('miner-currency').value;
             document.getElementById('miner-status').textContent = '🟢 Работает';
-            document.getElementById('miner-toggle-btn').textContent = '⏹ Остановить';
+            minerBtn.textContent = '⏹ Остановить';
             window.notify("Майнер запущен!", "success");
         }
-        await updateDoc(doc(db, "users", window.currentUser.uid), { miner: window.userData.miner });
+        savePlayerData();
     });
+
+    // Кнопка создания бизнеса
+    const bizBtn = document.getElementById('create-business-btn');
+    if (bizBtn) bizBtn.addEventListener('click', () => {
+        if ((window.userData.businesses || []).length >= 2) return window.notify("Максимум 2 бизнеса", "error");
+        let html = '<h3 style="margin-bottom: 15px;">Создать бизнес</h3>';
+        BUSINESS_TYPES.forEach(s => {
+            html += `<div class="list-item" onclick="createBiz('${s.id}')" style="cursor:pointer; margin:8px 0;"><b>${s.icon} ${s.name}</b><br><small>Цена: ${s.cost} | Доход: ${s.income}/день</small></div>`;
+        });
+        document.getElementById('modal-body').innerHTML = html;
+        document.getElementById('modal').classList.add('active');
+    });
+
+    // Живой таймер майнера
+    setInterval(() => {
+        if (!window.userData) return;
+        const m = window.userData.miner;
+        if (m && m.running && m.startTime) {
+            const elapsed = (Date.now() - new Date(m.startTime).getTime()) / 1000;
+            const maxSec = CONFIG.MINER_WORK_HOURS * 3600;
+            if (elapsed >= maxSec) {
+                const reward = (maxSec / 60) * CONFIG.MINER_REWARD_PER_MIN * window.userData.multiplier;
+                window.userData.balances[m.currency] = (window.userData.balances[m.currency] || 0) + reward;
+                addTransaction(`Майнер: +${reward.toFixed(6)} ${m.currency}`, 0);
+                m.running = false;
+                m.startTime = null;
+                savePlayerData();
+                showDiscordNotification("Майнер завершил!", `+${reward.toFixed(6)} ${m.currency}`, "⛏");
+                document.getElementById('miner-status').textContent = '🔴 Остановлен';
+                document.getElementById('miner-toggle-btn').textContent = '▶️ Запустить';
+                document.getElementById('miner-progress').style.width = '100%';
+            } else {
+                document.getElementById('miner-progress').style.width = `${(elapsed / maxSec) * 100}%`;
+                document.getElementById('miner-time-left').textContent = `${Math.ceil((maxSec - elapsed) / 60)} мин`;
+            }
+        }
+    }, 1000);
 });
 
-// ==================== РЫНОК ====================
+function checkOfflineMiner() {
+    const m = window.userData.miner;
+    if (!m || !m.running || !m.startTime) return;
+    const elapsed = (Date.now() - new Date(m.startTime).getTime()) / 1000;
+    const maxSec = CONFIG.MINER_WORK_HOURS * 3600;
+    if (elapsed >= maxSec) {
+        const reward = (maxSec / 60) * CONFIG.MINER_REWARD_PER_MIN * window.userData.multiplier;
+        window.userData.balances[m.currency] = (window.userData.balances[m.currency] || 0) + reward;
+        addTransaction(`Майнер: +${reward.toFixed(6)} ${m.currency}`, 0);
+        m.running = false;
+        m.startTime = null;
+        savePlayerData();
+        showDiscordNotification("Майнер завершил!", `+${reward.toFixed(6)} ${m.currency}`, "⛏");
+    } else {
+        document.getElementById('miner-progress').style.width = `${(elapsed / maxSec) * 100}%`;
+        document.getElementById('miner-time-left').textContent = `${Math.ceil((maxSec - elapsed) / 60)} мин`;
+        document.getElementById('miner-status').textContent = '🟢 Работает';
+        document.getElementById('miner-toggle-btn').textContent = '⏹ Остановить';
+    }
+}
+
+// ===== ТРАНЗАКЦИИ =====
+function addTransaction(desc, amount) {
+    if (!window.userData.transactions) window.userData.transactions = [];
+    window.userData.transactions.unshift({ desc, amount, date: new Date().toISOString() });
+    if (window.userData.transactions.length > 50) window.userData.transactions.pop();
+}
+
+// ===== РЫНОК (localStorage) =====
 const ASSETS = [
     { id: 'BTC', name: 'Bitcoin', icon: '₿', minPrice: 30, type: 'crypto' },
     { id: 'ETH', name: 'Ethereum', icon: 'Ξ', minPrice: 30, type: 'crypto' },
@@ -509,6 +410,18 @@ const ASSETS = [
 
 let currentMarketFilter = 'all';
 
+function getMarketData() {
+    try {
+        const d = JSON.parse(localStorage.getItem(MARKET_KEY));
+        if (d) return d;
+    } catch (e) {}
+    const init = {};
+    ASSETS.forEach(a => { init[a.id] = { price: a.minPrice, prevPrice: a.minPrice }; });
+    localStorage.setItem(MARKET_KEY, JSON.stringify(init));
+    return init;
+}
+function saveMarketData(d) { localStorage.setItem(MARKET_KEY, JSON.stringify(d)); }
+
 window.filterMarket = (filter) => {
     currentMarketFilter = filter;
     document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
@@ -516,80 +429,65 @@ window.filterMarket = (filter) => {
     renderMarket();
 };
 
-async function renderMarket() {
+function renderMarket() {
     const list = document.getElementById('market-list');
-    list.innerHTML = '<p style="text-align:center; color: var(--text-secondary);">Загрузка...</p>';
-    try {
-        const marketRef = doc(db, "global", "market_prices");
-        let marketData = {};
-        const snap = await getDoc(marketRef);
-        if (snap.exists()) marketData = snap.data();
-        else {
-            ASSETS.forEach(a => { marketData[a.id] = { price: a.minPrice, prevPrice: a.minPrice }; });
-            await setDoc(marketRef, marketData);
-        }
-        list.innerHTML = '';
-        const filtered = currentMarketFilter === 'all' ? ASSETS : ASSETS.filter(a => a.type === currentMarketFilter);
-        for (const asset of filtered) {
-            const data = marketData[asset.id] || { price: asset.minPrice, prevPrice: asset.minPrice };
-            const price = data.price, prevPrice = data.prevPrice;
-            const userBalance = window.userData.balances?.[asset.id] || 0;
-            const trend = price > prevPrice ? '🔼' : (price < prevPrice ? '🔽' : '➡️');
-            const trendColor = price > prevPrice ? 'var(--success-color)' : (price < prevPrice ? 'var(--error-color)' : 'var(--text-secondary)');
-            const div = document.createElement('div');
-            div.className = 'market-item';
-            div.innerHTML = `
-                <div class="market-info">
-                    <div class="market-name">${asset.icon} ${asset.name}</div>
-                    <div class="market-price" style="color: ${trendColor};">${trend} ${price.toFixed(2)} USDT</div>
-                    <div class="market-balance">Баланс: ${userBalance.toFixed(6)}</div>
-                </div>
-                <div class="market-actions">
-                    <button class="market-btn buy" onclick="tradeAsset('${asset.id}', 'buy', ${price})">Купить</button>
-                    <button class="market-btn sell" onclick="tradeAsset('${asset.id}', 'sell', ${price})">Продать</button>
-                </div>`;
-            list.appendChild(div);
-        }
-    } catch (error) {
-        list.innerHTML = `<p style="text-align:center; color: var(--error-color);">Ошибка: ${error.message}</p>`;
+    const marketData = getMarketData();
+    list.innerHTML = '';
+    const filtered = currentMarketFilter === 'all' ? ASSETS : ASSETS.filter(a => a.type === currentMarketFilter);
+    for (const asset of filtered) {
+        const data = marketData[asset.id] || { price: asset.minPrice, prevPrice: asset.minPrice };
+        const price = data.price, prevPrice = data.prevPrice;
+        const userBalance = window.userData.balances?.[asset.id] || 0;
+        const trend = price > prevPrice ? '🔼' : (price < prevPrice ? '🔽' : '➡️');
+        const trendColor = price > prevPrice ? 'var(--success-color)' : (price < prevPrice ? 'var(--error-color)' : 'var(--text-secondary)');
+        const div = document.createElement('div');
+        div.className = 'market-item';
+        div.innerHTML = `
+            <div class="market-info">
+                <div class="market-name">${asset.icon} ${asset.name}</div>
+                <div class="market-price" style="color: ${trendColor};">${trend} ${price.toFixed(2)} USDT</div>
+                <div class="market-balance">Баланс: ${userBalance.toFixed(6)}</div>
+            </div>
+            <div class="market-actions">
+                <button class="market-btn buy" onclick="tradeAsset('${asset.id}', 'buy', ${price})">Купить</button>
+                <button class="market-btn sell" onclick="tradeAsset('${asset.id}', 'sell', ${price})">Продать</button>
+            </div>`;
+        list.appendChild(div);
     }
 }
 
-window.tradeAsset = async (assetId, action, currentPrice) => {
+window.tradeAsset = (assetId, action, currentPrice) => {
     const amountStr = prompt(`Количество ${assetId} для ${action === 'buy' ? 'покупки' : 'продажи'}:`);
     if (!amountStr) return;
     const amount = parseFloat(amountStr.replace(',', '.'));
     if (isNaN(amount) || amount <= 0) return window.notify("Неверное количество", "error");
     const totalCost = amount * currentPrice;
+    const marketData = getMarketData();
     if (action === 'buy') {
         if (window.userData.usdt < totalCost) return window.notify("Недостаточно USDT", "error");
-        await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(-totalCost), [`balances.${assetId}`]: increment(amount) });
         window.userData.usdt -= totalCost;
-        if (!window.userData.balances) window.userData.balances = {};
         window.userData.balances[assetId] = (window.userData.balances[assetId] || 0) + amount;
+        // Покупка двигает цену вверх
+        marketData[assetId] = { price: Math.max(ASSETS.find(a=>a.id===assetId).minPrice, currentPrice * 1.02), prevPrice: currentPrice };
         addTransaction(`Покупка ${amount} ${assetId}`, -totalCost);
         window.notify(`✅ Куплено ${amount} ${assetId}`, "success");
     } else {
         const currentBal = window.userData.balances?.[assetId] || 0;
         if (currentBal < amount) return window.notify(`Недостаточно ${assetId}`, "error");
-        await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(totalCost), [`balances.${assetId}`]: increment(-amount) });
         window.userData.usdt += totalCost;
         window.userData.balances[assetId] -= amount;
+        // Продажа двигает цену вниз
+        marketData[assetId] = { price: Math.max(ASSETS.find(a=>a.id===assetId).minPrice, currentPrice * 0.98), prevPrice: currentPrice };
         addTransaction(`Продажа ${amount} ${assetId}`, totalCost);
         window.notify(`✅ Продано ${amount} ${assetId}`, "success");
     }
-    window.updateUI();
+    saveMarketData(marketData);
+    savePlayerData();
+    updateUI();
     renderMarket();
 };
 
-function addTransaction(description, amount) {
-    if (!window.userData.transactions) window.userData.transactions = [];
-    window.userData.transactions.unshift({ desc: description, amount, date: new Date().toISOString() });
-    if (window.userData.transactions.length > 50) window.userData.transactions.pop();
-    updateDoc(doc(db, "users", window.currentUser.uid), { transactions: window.userData.transactions });
-}
-
-// ==================== ИНВЕСТИЦИИ ====================
+// ===== ИНВЕСТИЦИИ =====
 const ENTERPRISES = [
     { id: 'school', name: 'Школа', logo: '🏫' }, { id: 'wb', name: 'Wildberries', logo: '🟣' },
     { id: 'ozon', name: 'Ozon', logo: '🔵' }, { id: 'ai', name: 'AI', logo: '🤖' },
@@ -605,7 +503,7 @@ function getCurrentInvestments() {
     return shuffled.slice(0, 5).map((ent, i) => ({ ...ent, winChance: 10 + i * 10, profitPercent: 80 - i * 10, maxBet: 3000 + i * 500, minBet: 500 }));
 }
 
-async function renderInvestments() {
+function renderInvestments() {
     const list = document.getElementById('investments-list');
     list.innerHTML = '';
     getCurrentInvestments().forEach(inv => {
@@ -631,43 +529,41 @@ async function renderInvestments() {
     });
 }
 
-window.makeInvestment = async (id, chance, profit, maxBet) => {
+window.makeInvestment = (id, chance, profit, maxBet) => {
     const input = document.getElementById(`inv-amount-${id}`);
     const amount = parseFloat(input.value.replace(',', '.'));
     if (!amount || amount < 500 || amount > maxBet) return window.notify(`Сумма от 500 до ${maxBet}`, "error");
     if (window.userData.usdt < amount) return window.notify("Недостаточно USDT", "error");
     const newInv = { id, name: ENTERPRISES.find(e => e.id === id).name, amount, chance, profit, startTime: new Date().toISOString() };
-    const active = [...(window.userData.activeInvestments || []), newInv];
-    await updateDoc(doc(db, "users", window.currentUser.uid), { activeInvestments: active, usdt: increment(-amount) });
+    window.userData.activeInvestments = [...(window.userData.activeInvestments || []), newInv];
     window.userData.usdt -= amount;
-    window.userData.activeInvestments = active;
     addTransaction(`Инвестиция в ${newInv.name}`, -amount);
-    window.updateUI();
+    savePlayerData();
+    updateUI();
     renderInvestments();
     window.notify("Инвестиция размещена!", "success");
 };
 
-window.resolveInvestment = async (index) => {
+window.resolveInvestment = (index) => {
     const actives = window.userData.activeInvestments;
     const inv = actives[index];
     const isWin = Math.random() * 100 < inv.chance;
     if (isWin) {
         const total = inv.amount * (1 + inv.profit / 100);
-        await updateDoc(doc(db, "users", window.currentUser.uid), { activeInvestments: actives.filter((_, i) => i !== index), usdt: increment(total) });
         window.userData.usdt += total;
         addTransaction(`Прибыль от ${inv.name}`, total);
         showDiscordNotification("Инвестиция успешна!", `+${total.toFixed(2)} USDT`, "💰");
     } else {
-        await updateDoc(doc(db, "users", window.currentUser.uid), { activeInvestments: actives.filter((_, i) => i !== index) });
         addTransaction(`Убыток от ${inv.name}`, -inv.amount);
         showDiscordNotification("Инвестиция провалилась", `-${inv.amount.toFixed(2)} USDT`, "📉");
     }
     window.userData.activeInvestments = actives.filter((_, i) => i !== index);
-    window.updateUI();
+    savePlayerData();
+    updateUI();
     renderInvestments();
 };
 
-// ==================== БИЗНЕСЫ ====================
+// ===== БИЗНЕСЫ =====
 const BUSINESS_TYPES = [
     { id: 'it', name: 'IT-стартап', icon: '💻', cost: 2000, income: 100 },
     { id: 'restaurant', name: 'Ресторан', icon: '🍽️', cost: 3000, income: 150 },
@@ -676,7 +572,7 @@ const BUSINESS_TYPES = [
     { id: 'beauty', name: 'Салон красоты', icon: '💇', cost: 3500, income: 180 }
 ];
 
-async function renderBusinesses() {
+function renderBusinesses() {
     const list = document.getElementById('businesses-list');
     list.innerHTML = '';
     const bizs = window.userData.businesses || [];
@@ -693,75 +589,56 @@ async function renderBusinesses() {
     });
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-    const btn = document.getElementById('create-business-btn');
-    if (btn) btn.addEventListener('click', () => {
-        if ((window.userData.businesses || []).length >= 2) return window.notify("Максимум 2 бизнеса", "error");
-        let html = '<h3 style="margin-bottom: 15px;">Создать бизнес</h3>';
-        BUSINESS_TYPES.forEach(s => {
-            html += `<div class="list-item" onclick="createBiz('${s.id}')" style="cursor:pointer; margin:8px 0;"><b>${s.icon} ${s.name}</b><br><small>Цена: ${s.cost} | Доход: ${s.income}/день</small></div>`;
-        });
-        document.getElementById('modal-body').innerHTML = html;
-        document.getElementById('modal').classList.add('active');
-    });
-});
-
-window.createBiz = async (typeId) => {
+window.createBiz = (typeId) => {
     const name = prompt("Название бизнеса:");
     if (!name) return;
     const bizType = BUSINESS_TYPES.find(t => t.id === typeId);
     if (window.userData.usdt < bizType.cost) return window.notify("Недостаточно средств", "error");
-    const newBiz = { type: typeId, name, level: 1, totalInvested: bizType.cost, isBroken: false, lastCheckTime: new Date().toISOString() };
-    const bizs = [...(window.userData.businesses || []), newBiz];
-    await updateDoc(doc(db, "users", window.currentUser.uid), { businesses: bizs, usdt: increment(-bizType.cost) });
+    const newBiz = { type: typeId, name, level: 1, totalInvested: bizType.cost, isBroken: false };
+    window.userData.businesses = [...(window.userData.businesses || []), newBiz];
     window.userData.usdt -= bizType.cost;
-    window.userData.businesses = bizs;
     addTransaction(`Бизнес "${name}"`, -bizType.cost);
-    window.closeModal();
-    window.updateUI();
+    closeModal();
+    savePlayerData();
+    updateUI();
     renderBusinesses();
     window.notify("Бизнес создан!", "success");
 };
 
-window.repairBusiness = async (index) => {
+window.repairBusiness = (index) => {
     if (window.userData.usdt < 600) return window.notify("Нужно 600 USDT", "error");
-    const bizs = window.userData.businesses;
-    bizs[index].isBroken = false;
-    await updateDoc(doc(db, "users", window.currentUser.uid), { businesses: bizs, usdt: increment(-600) });
+    window.userData.businesses[index].isBroken = false;
     window.userData.usdt -= 600;
-    window.userData.businesses = bizs;
     addTransaction("Ремонт бизнеса", -600);
-    window.updateUI();
+    savePlayerData();
+    updateUI();
     renderBusinesses();
     window.notify("Отремонтирован!", "success");
 };
 
-window.sellBusiness = async (index) => {
-    const bizs = window.userData.businesses;
-    const refund = bizs[index].totalInvested * 0.4;
-    bizs.splice(index, 1);
-    await updateDoc(doc(db, "users", window.currentUser.uid), { businesses: bizs, usdt: increment(refund) });
+window.sellBusiness = (index) => {
+    const refund = window.userData.businesses[index].totalInvested * 0.4;
+    window.userData.businesses.splice(index, 1);
     window.userData.usdt += refund;
-    window.userData.businesses = bizs;
     addTransaction("Продажа бизнеса", refund);
-    window.updateUI();
+    savePlayerData();
+    updateUI();
     renderBusinesses();
     window.notify(`Продан за ${refund.toFixed(2)} USDT`, "success");
 };
 
-// ==================== БАНК ====================
-async function renderBank() {
+// ===== БАНК =====
+function renderBank() {
     const bankData = window.userData.bank || { deposit: 0, loan: 0 };
     document.getElementById('bank-deposit').textContent = bankData.deposit.toFixed(2) + ' USDT';
     document.getElementById('bank-loan').textContent = bankData.loan.toFixed(2) + ' USDT';
 }
 
-window.bankAction = async (action) => {
+window.bankAction = (action) => {
     const bankData = window.userData.bank || { deposit: 0, depositDate: null, loan: 0, loanDate: null };
     const now = Date.now();
     if (action === 'deposit') {
         if (window.userData.usdt < 100) return window.notify("Минимум 100 USDT", "error");
-        await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(-100), "bank.deposit": increment(100), "bank.depositDate": now });
         window.userData.usdt -= 100;
         window.userData.bank = { ...bankData, deposit: bankData.deposit + 100, depositDate: now };
         addTransaction("Вклад", -100);
@@ -771,14 +648,12 @@ window.bankAction = async (action) => {
         const days = (now - bankData.depositDate) / 86400000;
         if (days < 7) return window.notify(`Мин. 7 дней. Осталось: ${Math.ceil(7 - days)}`, "error");
         const total = bankData.deposit * Math.pow(1.02, days);
-        await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(total), "bank.deposit": 0, "bank.depositDate": null });
         window.userData.usdt += total;
-        window.userData.bank.deposit = 0;
+        window.userData.bank = { ...bankData, deposit: 0, depositDate: null };
         addTransaction("Снятие вклада", total);
         window.notify(`✅ +${total.toFixed(2)} USDT`, "success");
     } else if (action === 'loan') {
         if (bankData.loan > 0) return window.notify("Сначала погасите кредит", "error");
-        await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(1000), "bank.loan": 1000, "bank.loanDate": now });
         window.userData.usdt += 1000;
         window.userData.bank = { ...bankData, loan: 1000, loanDate: now };
         addTransaction("Кредит", 1000);
@@ -788,145 +663,102 @@ window.bankAction = async (action) => {
         const days = (now - bankData.loanDate) / 86400000;
         const debt = bankData.loan * Math.pow(1.05, days);
         if (window.userData.usdt < debt) return window.notify(`Нужно ${debt.toFixed(2)} USDT`, "error");
-        await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(-debt), "bank.loan": 0, "bank.loanDate": null });
         window.userData.usdt -= debt;
-        window.userData.bank.loan = 0;
+        window.userData.bank = { ...bankData, loan: 0, loanDate: null };
         addTransaction("Погашение кредита", -debt);
         window.notify(`✅ Погашено ${debt.toFixed(2)} USDT`, "success");
     }
-    window.updateUI();
+    savePlayerData();
+    updateUI();
     renderBank();
 };
 
-// ==================== КРАЖА ====================
-document.addEventListener('DOMContentLoaded', () => {
-    const btn = document.getElementById('theft-search-btn');
-    if (btn) btn.addEventListener('click', async () => {
-        if (window.userData.usdt < 10) return window.notify("Нужно 10 USDT", "error");
-        document.getElementById('theft-search-btn').style.display = 'none';
-        document.getElementById('theft-animation').style.display = 'block';
-        await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(-10) });
-        window.userData.usdt -= 10;
-        window.updateUI();
-        const statusText = document.getElementById('theft-status-text');
-        await new Promise(r => setTimeout(r, 1500));
-        statusText.textContent = "Сканирование уязвимостей...";
-        await new Promise(r => setTimeout(r, 1500));
-        statusText.textContent = "Жертва найдена!";
-        await new Promise(r => setTimeout(r, 1500));
-        const victimNick = "Игрок_" + Math.floor(Math.random() * 9999);
-        const victimBalance = 500 + Math.floor(Math.random() * 2000);
-        document.getElementById('theft-animation').style.display = 'none';
-        const resultDiv = document.getElementById('theft-result');
-        resultDiv.style.display = 'block';
-        resultDiv.innerHTML = `<h3>🎯 Жертва: ${victimNick}</h3><p>Баланс: ~${victimBalance} USDT</p><p>Риск:</p><div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:10px;"><button class="btn-secondary" onclick="executeTheft(1, 40, ${victimBalance})">1% (40%)</button><button class="btn-secondary" onclick="executeTheft(3, 18, ${victimBalance})">3% (18%)</button><button class="btn-secondary" onclick="executeTheft(5, 5, ${victimBalance})">5% (5%)</button></div><button class="btn-secondary" style="margin-top:15px;" onclick="resetTheftUI()">Отмена</button>`;
-    });
-});
+// ===== АУКЦИОНЫ (localStorage) =====
+function getAuctions() {
+    try { return JSON.parse(localStorage.getItem(AUCTIONS_KEY)) || []; } catch (e) { return []; }
+}
+function saveAuctions(list) { localStorage.setItem(AUCTIONS_KEY, JSON.stringify(list)); }
 
-window.executeTheft = async (percent, chance, victimBal) => {
-    const isWin = Math.random() * 100 < chance;
-    const amount = victimBal * (percent / 100);
-    if (isWin) {
-        await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(amount) });
-        window.userData.usdt += amount;
-        addTransaction("Кража", amount);
-        showDiscordNotification("Кража успешна!", `+${amount.toFixed(2)} USDT`, "⚔️");
-    } else {
-        const penalty = window.userData.usdt * (percent / 100);
-        await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(-penalty) });
-        window.userData.usdt -= penalty;
-        addTransaction("Провал кражи", -penalty);
-        window.notify(`❌ -${penalty.toFixed(2)} USDT`, "error");
-    }
-    window.updateUI();
-    resetTheftUI();
-};
-
-window.resetTheftUI = () => {
-    document.getElementById('theft-animation').style.display = 'none';
-    document.getElementById('theft-result').style.display = 'none';
-    document.getElementById('theft-search-btn').style.display = 'block';
-};
-
-// ==================== АУКЦИОНЫ ====================
-async function renderAuctions() {
-    const list = document.getElementById('auction-list');
-    list.innerHTML = '<p style="text-align:center; color: var(--text-secondary);">Загрузка...</p>';
-    try {
-        const auctionsRef = collection(db, "auctions");
-        const q = query(auctionsRef, where("status", "==", "active"));
-        const snapshot = await getDocs(q);
-        list.innerHTML = '';
-        if (snapshot.empty) {
-            await addDoc(auctionsRef, { currentBid: 100, highestBidderId: null, highestBidderNick: null, endTime: new Date(Date.now() + 7200000), status: "active" });
-            return renderAuctions();
+function checkAuctions() {
+    const list = getAuctions();
+    let changed = false;
+    const now = Date.now();
+    list.forEach(a => {
+        if (a.status === 'active' && a.endTime <= now) {
+            a.status = 'ended';
+            changed = true;
+            if (a.highestBidderKey) {
+                const accounts = getAccounts();
+                const acc = accounts[a.highestBidderKey];
+                if (acc) {
+                    const contents = a.currentBid * (0.8 + Math.random() * 0.7);
+                    acc.data.usdt += contents;
+                    if (!acc.data.transactions) acc.data.transactions = [];
+                    acc.data.transactions.unshift({ desc: 'Выигрыш аукциона', amount: contents, date: new Date().toISOString() });
+                    saveAccounts(accounts);
+                    if (a.highestBidderKey === window.currentUserKey) {
+                        window.userData = acc.data;
+                        showDiscordNotification("Аукцион завершён!", `В кошельке ${contents.toFixed(2)} USDT`, "🔨");
+                    }
+                }
+            }
         }
-        snapshot.forEach(docSnap => {
-            const data = docSnap.data();
-            const hoursLeft = Math.max(0, Math.ceil((data.endTime.toDate().getTime() - Date.now()) / 3600000));
-            const div = document.createElement('div');
-            div.className = 'list-item';
-            div.style.flexDirection = 'column';
-            div.style.alignItems = 'flex-start';
-            div.innerHTML = `<strong>🔒 Кошелёк #${docSnap.id.substr(0, 6)}</strong><small>Ставка: <b>${data.currentBid.toFixed(2)} USDT</b></small><small>Лидер: ${data.highestBidderNick || 'Нет'}</small><small style="color: var(--error-color);">⏳ ${hoursLeft} ч.</small><small style="color: var(--text-secondary); font-size: 11px;">⚠️ Ставка невозвратна!</small><div style="display:flex; gap:10px; margin-top:10px; width:100%;"><input type="number" id="bid-input-${docSnap.id}" placeholder="Ставка" style="flex:1;"><button class="btn-primary" style="width:auto;" onclick="placeBid('${docSnap.id}', ${data.currentBid})">Ставка</button></div>`;
-            list.appendChild(div);
-        });
-    } catch (error) {
-        list.innerHTML = `<p style="text-align:center; color: var(--error-color);">Ошибка: ${error.message}</p>`;
-    }
+    });
+    if (changed) saveAuctions(list);
 }
 
-window.placeBid = async (auctionId, currentBid) => {
+function renderAuctions() {
+    checkAuctions();
+    let auctions = getAuctions();
+    let active = auctions.filter(a => a.status === 'active');
+    if (active.length === 0) {
+        auctions.push({
+            id: 'a' + Date.now(),
+            currentBid: 100,
+            highestBidderKey: null,
+            highestBidderNick: null,
+            endTime: Date.now() + 2 * 60 * 60 * 1000,
+            status: 'active'
+        });
+        saveAuctions(auctions);
+        active = auctions.filter(a => a.status === 'active');
+    }
+    const list = document.getElementById('auction-list');
+    list.innerHTML = '';
+    active.forEach(a => {
+        const hoursLeft = Math.max(0, Math.ceil((a.endTime - Date.now()) / 3600000));
+        const div = document.createElement('div');
+        div.className = 'list-item';
+        div.style.flexDirection = 'column';
+        div.style.alignItems = 'flex-start';
+        div.innerHTML = `<strong>🔒 Кошелёк #${a.id.substr(-6)}</strong><small>Ставка: <b>${a.currentBid.toFixed(2)} USDT</b></small><small>Лидер: ${a.highestBidderNick || 'Нет'}</small><small style="color: var(--error-color);">⏳ ${hoursLeft} ч.</small><small style="color: var(--text-secondary); font-size: 11px;">⚠️ Ставка невозвратна!</small><div style="display:flex; gap:10px; margin-top:10px; width:100%;"><input type="number" id="bid-input-${a.id}" placeholder="Ставка" style="flex:1;"><button class="btn-primary" style="width:auto;" onclick="placeBid('${a.id}', ${a.currentBid})">Ставка</button></div>`;
+        list.appendChild(div);
+    });
+}
+
+window.placeBid = (auctionId, currentBid) => {
     const input = document.getElementById(`bid-input-${auctionId}`);
     const newBid = parseFloat(input.value.replace(',', '.'));
     if (isNaN(newBid) || newBid <= currentBid) return window.notify(`Ставка выше ${currentBid}`, "error");
     if (window.userData.usdt < newBid) return window.notify("Недостаточно USDT", "error");
-    await updateDoc(doc(db, "auctions", auctionId), { currentBid: newBid, highestBidderId: window.currentUser.uid, highestBidderNick: window.userData.nick, endTime: new Date(Date.now() + 3600000) });
-    await updateDoc(doc(db, "users", window.currentUser.uid), { usdt: increment(-newBid) });
+    const auctions = getAuctions();
+    const a = auctions.find(x => x.id === auctionId);
+    if (!a || a.status !== 'active') return window.notify("Аукцион завершён", "error");
+    a.currentBid = newBid;
+    a.highestBidderKey = window.currentUserKey;
+    a.highestBidderNick = window.userData.nick;
+    a.endTime = Date.now() + 60 * 60 * 1000;
+    saveAuctions(auctions);
     window.userData.usdt -= newBid;
     addTransaction("Ставка на аукционе", -newBid);
-    window.updateUI();
+    savePlayerData();
+    updateUI();
     renderAuctions();
     window.notify(`✅ Ставка ${newBid} USDT!`, "success");
 };
 
-// ==================== ТОП ====================
-window.switchTop = (type) => {
-    document.querySelectorAll('.top-toggle-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.top-list').forEach(l => l.classList.remove('active'));
-    document.getElementById(`btn-${type}`).classList.add('active');
-    document.getElementById(`top-${type}-list`).classList.add('active');
-};
-
-async function loadTopData() {
-    const playersList = document.getElementById('top-players-list');
-    playersList.innerHTML = '<p style="text-align:center; color: var(--text-secondary);">Загрузка...</p>';
-    try {
-        let snapshot;
-        try {
-            snapshot = await getDocsFromServer(query(collection(db, "users")));
-        } catch (e) {
-            snapshot = await getDocs(query(collection(db, "users")));
-        }
-        let players = [];
-        snapshot.forEach(docSnap => { const d = docSnap.data(); players.push({ nick: d.nick, usdt: d.usdt }); });
-        players.sort((a, b) => b.usdt - a.usdt);
-        players = players.slice(0, 10);
-        playersList.innerHTML = '';
-        players.forEach((p, idx) => {
-            const div = document.createElement('div');
-            div.className = 'list-item';
-            div.innerHTML = `<span>#${idx + 1} ${p.nick}</span><span style="color: var(--money-color); font-weight: 700;">${p.usdt.toFixed(2)} USDT</span>`;
-            playersList.appendChild(div);
-        });
-    } catch (error) {
-        playersList.innerHTML = `<p style="text-align:center; color: var(--error-color);">Ошибка: ${error.message}</p>`;
-    }
-    document.getElementById('top-clans-list').innerHTML = '<p style="text-align:center; color: var(--text-secondary);">Кланы скоро</p>';
-}
-
-// ==================== ПРОФИЛЬ ====================
-async function renderProfile() {
+// ===== ПРОФИЛЬ / НАСТРОЙКИ =====
+function renderProfile() {
     if (!window.userData) return;
     document.getElementById('profile-nick').textContent = window.userData.nick;
     document.getElementById('profile-level').textContent = window.userData.level;
@@ -940,13 +772,6 @@ window.openSettings = () => {
             <span class="settings-label">Вибрация:</span>
             <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                 <input type="checkbox" id="setting-vibration" ${window.settings.vibration ? 'checked' : ''}>
-                <span>Вкл</span>
-            </label>
-        </div>
-        <div class="settings-row">
-            <span class="settings-label">Подсказки:</span>
-            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                <input type="checkbox" id="setting-tooltips" ${window.settings.tooltips ? 'checked' : ''}>
                 <span>Вкл</span>
             </label>
         </div>
@@ -975,17 +800,16 @@ window.openSettings = () => {
         <div class="settings-row">
             <span class="settings-label">Позиция уведомлений:</span>
             <div class="color-toggle" id="notif-pos-toggle">
-                <button class="color-toggle-btn ${window.settings.notifPosition === 'top-left' ? 'active' : ''}" onclick="setNotifPosition('top-left')">↖ Верх лево</button>
-                <button class="color-toggle-btn ${window.settings.notifPosition === 'top-right' ? 'active' : ''}" onclick="setNotifPosition('top-right')">↗ Верх право</button>
-                <button class="color-toggle-btn ${window.settings.notifPosition === 'bottom-left' ? 'active' : ''}" onclick="setNotifPosition('bottom-left')">↙ Низ лево</button>
-                <button class="color-toggle-btn ${window.settings.notifPosition === 'bottom-right' ? 'active' : ''}" onclick="setNotifPosition('bottom-right')">↘ Низ право</button>
+                <button class="color-toggle-btn ${window.settings.notifPosition === 'top-left' ? 'active' : ''}" onclick="setNotifPosition('top-left')">↖</button>
+                <button class="color-toggle-btn ${window.settings.notifPosition === 'top-right' ? 'active' : ''}" onclick="setNotifPosition('top-right')">↗</button>
+                <button class="color-toggle-btn ${window.settings.notifPosition === 'bottom-left' ? 'active' : ''}" onclick="setNotifPosition('bottom-left')">↙</button>
+                <button class="color-toggle-btn ${window.settings.notifPosition === 'bottom-right' ? 'active' : ''}" onclick="setNotifPosition('bottom-right')">↘</button>
             </div>
         </div>
         <button class="btn-primary" onclick="saveSettings()">Сохранить</button>
     `;
     document.getElementById('modal-body').innerHTML = html;
     document.getElementById('modal').classList.add('active');
-
     document.getElementById('color1-picker').addEventListener('input', (e) => { e.target.parentElement.style.background = e.target.value; });
     document.getElementById('color2-picker').addEventListener('input', (e) => { e.target.parentElement.style.background = e.target.value; });
     document.getElementById('color3-picker').addEventListener('input', (e) => { e.target.parentElement.style.background = e.target.value; });
@@ -1009,13 +833,12 @@ window.setNotifPosition = (pos) => {
 
 window.saveSettings = () => {
     window.settings.vibration = document.getElementById('setting-vibration').checked;
-    window.settings.tooltips = document.getElementById('setting-tooltips').checked;
     window.settings.bgColor1 = document.getElementById('color1-picker').value;
     window.settings.bgColor2 = document.getElementById('color2-picker').value;
     window.settings.bgColor3 = document.getElementById('color3-picker').value;
     applyBackgroundColors();
     saveSettingsToStorage();
-    window.closeModal();
+    closeModal();
     window.notify("Настройки сохранены!", "success");
 };
 
@@ -1035,7 +858,7 @@ window.openTransactionHistory = () => {
 
 window.closeModal = () => { document.getElementById('modal').classList.remove('active'); };
 
-// ==================== МУЗЫКА ====================
+// ===== МУЗЫКА =====
 window.musicState = { ctx: null, master: null, on: false, timer: null };
 
 const CHORDS = [
@@ -1044,7 +867,6 @@ const CHORDS = [
     [174.61, 220.00, 261.63, 349.23],
     [196.00, 246.94, 293.66, 392.00]
 ];
-
 const MELODY = [523.25, 587.33, 659.25, 783.99, 880.00, 1046.50];
 
 function audioInit() {
@@ -1136,4 +958,10 @@ document.addEventListener('pointerdown', () => {
     if (window.settings.music && !window.musicState.on) applyMusic();
 }, { once: true });
 
-console.log('✅ Путь к успеху загружен!');
+// ===== СТАРТ =====
+// Если есть сохранённая сессия — входим сразу, без ввода пароля
+if (!enterGame()) {
+    // сессии нет — показываем экран входа (он виден по умолчанию)
+}
+
+console.log('✅ Путь к успеху (локальная версия) загружен!');
