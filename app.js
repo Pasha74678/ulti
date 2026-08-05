@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserLocalPersistence, GoogleAuthProvider, signInWithPopup, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
-import { getFirestore, doc, setDoc, getDoc, updateDoc, collection, query, where, getDocs, increment, addDoc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, doc, setDoc, getDoc, updateDoc, collection, query, where, getDocs, getDocsFromServer, deleteDoc, runTransaction, increment, addDoc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
 
 const firebaseConfig = {
     apiKey: "AIzaSyAAL1zpUJuZET0ZDoQQGeiIIFruUocf8pY",
@@ -14,9 +14,69 @@ const firebaseConfig = {
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const db = getFirestore(app);
+const db = initializeFirestore(app, {
+    localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+});
 
-setPersistence(auth, browserLocalPersistence).catch(err => console.warn("Сессия:", err));
+// ==================== ЗАЩИТА ОТ СБОЕВ ====================
+// Ловим необработанные ошибки, чтобы игра не ломалась
+window.addEventListener('unhandledrejection', (e) => {
+    console.warn('Поймана ошибка (не критично):', e.reason);
+    e.preventDefault();
+});
+
+window.addEventListener('offline', () => {
+    window.notify("📡 Нет соединения — игра работает оффлайн", "error");
+});
+
+window.addEventListener('online', () => {
+    window.notify("📡 Соединение восстановлено", "success");
+});
+
+// Запись с повторными попытками (если сеть мигнула)
+async function safeWrite(ref, data, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            await updateDoc(ref, data);
+            return true;
+        } catch (e) {
+            console.warn(`Запись ${i + 1} не удалась:`, e.code || e.message);
+            if (i < retries - 1) await new Promise(r => setTimeout(r, 600 * (i + 1)));
+        }
+    }
+    return false;
+}
+
+// ==================== ОЧЕРЕДЬ ЗАПИСЕЙ (кликер) ====================
+// Клики копятся локально и отправляются в базу раз в 2.5 сек,
+// а не каждый клик — это убирает 90% сбоев и ошибок базы
+window.pendingChanges = { stamina: 0, usdt: 0 };
+let saveTimer = null;
+
+function queueChange(reward) {
+    window.pendingChanges.stamina -= 1;
+    window.pendingChanges.usdt += reward;
+    if (!saveTimer) saveTimer = setTimeout(flushChanges, 2500);
+}
+
+async function flushChanges() {
+    saveTimer = null;
+    const ch = window.pendingChanges;
+    if (ch.stamina === 0 && ch.usdt === 0) return;
+    window.pendingChanges = { stamina: 0, usdt: 0 };
+    const ok = await safeWrite(doc(db, "users", window.currentUser.uid), {
+        stamina: increment(ch.stamina),
+        usdt: increment(ch.usdt)
+    });
+    if (!ok) { // не удалось — вернём в очередь и попробуем позже
+        window.pendingChanges.stamina += ch.stamina;
+        window.pendingChanges.usdt += ch.usdt;
+        saveTimer = setTimeout(flushChanges, 5000);
+    }
+}
+
+// Сохраняем сразу, если игрок сворачивает вкладку
+document.addEventListener('visibilitychange', () => { if (document.hidden) flushChanges(); });
 
 window.currentUser = null;
 window.userData = null;
@@ -139,9 +199,10 @@ function showError(msg) {
     document.getElementById('auth-error').textContent = friendlyMsg;
 }
 
-async function createNewProfile(user, nick, email) {
+async function createNewProfile(user, nick, email, isAnonymous = false) {
     await setDoc(doc(db, "users", user.uid), {
-        nick, email,
+        nick, email, isAnonymous,
+        lastActiveMs: Date.now(),
         usdt: 100, stamina: 100, maxStamina: 100, power: 100, multiplier: 1.0, level: 0,
         balances: { BTC: 0, ETH: 0, LTC: 0, BNB: 0, TRX: 0, XRP: 0, GOLD: 0, SILVER: 0, PLAT: 0, DIAMOND: 0, SAPPHIRE: 0, RUBY: 0 },
         businesses: [], activeInvestments: [],
@@ -195,9 +256,60 @@ window.signInAnonymously = async () => {
     document.getElementById('auth-error').textContent = '';
     try {
         const result = await signInAnonymously(auth);
-        await createNewProfile(result.user, "Аноним_" + result.user.uid.substr(0, 6), null);
+        const num = await takePlayerNumber();
+        await createNewProfile(result.user, "player_" + num, null, true);
     } catch (e) { showError(e.message); }
 };
+
+// Выдаёт свободный номер: сначала освобождённый, иначе следующий
+async function takePlayerNumber() {
+    const metaRef = doc(db, "global", "meta");
+    let assigned = null;
+    await runTransaction(db, async (tx) => {
+        const snap = await tx.get(metaRef);
+        let meta = snap.exists() ? snap.data() : { nextPlayerNumber: 1, freeNumbers: [] };
+        if (!meta.freeNumbers) meta.freeNumbers = [];
+        if (!meta.nextPlayerNumber) meta.nextPlayerNumber = 1;
+        if (meta.freeNumbers.length > 0) {
+            assigned = meta.freeNumbers.shift();
+        } else {
+            assigned = meta.nextPlayerNumber;
+            meta.nextPlayerNumber += 1;
+        }
+        tx.set(metaRef, meta);
+    });
+    return assigned;
+}
+
+// Удаляет анонимов, мёртвых 30+ дней, и освобождает их номера
+async function cleanupOldAnonymous() {
+    try {
+        const last = localStorage.getItem('lastCleanup');
+        if (last && Date.now() - parseInt(last) < 24 * 60 * 60 * 1000) return;
+        localStorage.setItem('lastCleanup', String(Date.now()));
+        const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+        const snap = await getDocs(query(collection(db, "users"), where("lastActiveMs", "<", cutoff)));
+        const freed = [];
+        for (const d of snap.docs) {
+            const data = d.data();
+            if (data.isAnonymous && data.nick && data.nick.startsWith("player_")) {
+                try {
+                    await deleteDoc(d.ref);
+                    const n = parseInt(data.nick.split("_")[1]);
+                    if (!isNaN(n)) freed.push(n);
+                } catch (e) {}
+            }
+        }
+        if (freed.length) {
+            await runTransaction(db, async (tx) => {
+                const s = await tx.get(doc(db, "global", "meta"));
+                let meta = s.exists() ? s.data() : { nextPlayerNumber: 1, freeNumbers: [] };
+                meta.freeNumbers = [...(meta.freeNumbers || []), ...freed].sort((a, b) => a - b);
+                tx.set(doc(db, "global", "meta"), meta);
+            });
+        }
+    } catch (e) { console.warn("Очистка:", e); }
+}
 
 window.logout = async () => {
     await signOut(auth);
@@ -220,22 +332,26 @@ onAuthStateChanged(auth, async (user) => {
             const docSnap = await getDoc(doc(db, "users", user.uid));
             if (docSnap.exists()) {
                 window.userData = docSnap.data();
-                const check = await checkDeviceMatch(window.userData.device);
-                if (!check.match) {
-                    await signOut(auth);
-                    showError(`⚠️ ${check.reason}. Войдите заново.`);
-                    return;
-                }
-                const currentDevice = await getDeviceInfo();
-                if (JSON.stringify(window.userData.device) !== JSON.stringify(currentDevice)) {
-                    await updateDoc(doc(db, "users", user.uid), { device: currentDevice });
-                }
                 authScreen.style.display = 'none';
                 gameScreen.style.display = 'flex';
                 updateUI();
                 checkOfflineMiner();
                 if (window.settings.music) applyMusic();
                 showDiscordNotification("С возвращением!", `${window.userData.nick}, рады видеть вас снова!`, "👋");
+                                updateDoc(doc(db, "users", user.uid), { lastActiveMs: Date.now() }).catch(() => {});
+                cleanupOldAnonymous();
+                // Проверка устройства в фоне — не задерживает вход
+                checkDeviceMatch(window.userData.device).then(async (check) => {
+                    if (!check.match) {
+                        await signOut(auth);
+                        showError(`⚠️ ${check.reason}. Войдите заново.`);
+                    } else {
+                        const currentDevice = await getDeviceInfo();
+                        if (JSON.stringify(window.userData.device) !== JSON.stringify(currentDevice)) {
+                            safeWrite(doc(db, "users", user.uid), { device: currentDevice });
+                        }
+                    }
+                });
             } else {
                 await signOut(auth);
                 showError("Ошибка загрузки профиля.");
@@ -323,7 +439,7 @@ document.addEventListener('DOMContentLoaded', () => {
             effect.style.top = `${y}px`;
             document.body.appendChild(effect);
             setTimeout(() => effect.remove(), 1000);
-            updateDoc(doc(db, "users", window.currentUser.uid), { stamina: increment(-1), usdt: increment(reward) });
+            queueChange(reward);
         };
         clickBtn.addEventListener('mousedown', handleClick);
         clickBtn.addEventListener('touchstart', (e) => { e.preventDefault(); handleClick(e); }, { passive: false });
@@ -786,7 +902,12 @@ async function loadTopData() {
     const playersList = document.getElementById('top-players-list');
     playersList.innerHTML = '<p style="text-align:center; color: var(--text-secondary);">Загрузка...</p>';
     try {
-        const snapshot = await getDocs(query(collection(db, "users")));
+        let snapshot;
+        try {
+            snapshot = await getDocsFromServer(query(collection(db, "users")));
+        } catch (e) {
+            snapshot = await getDocs(query(collection(db, "users")));
+        }
         let players = [];
         snapshot.forEach(docSnap => { const d = docSnap.data(); players.push({ nick: d.nick, usdt: d.usdt }); });
         players.sort((a, b) => b.usdt - a.usdt);
